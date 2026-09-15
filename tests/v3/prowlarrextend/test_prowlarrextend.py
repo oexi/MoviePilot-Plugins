@@ -250,7 +250,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(manifest["ProwlarrExtend"]["version"], module.ProwlarrExtend.plugin_version)
             self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
             self.assertEqual(manifest["ProwlarrExtend"]["author"], "oexi")
-            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.20")
+            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.21")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "oexi")
@@ -1139,6 +1139,64 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                     self.assertEqual(result[0].title, title)
                     self.assertIsNone(plugin._last_search_error)
 
+    def test_parser_clears_shared_page_url_for_distinct_torrents(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }
+            plugin._last_error = None
+            plugin._state_lock = module.ProwlarrExtend._state_lock
+
+            class Request:
+                response = None
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, *_args, **_kwargs):
+                    return self.response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
+
+            module.RequestUtils = Request
+            xml = """<?xml version='1.0'?><rss><channel>
+              <item><title>Shared A</title><guid>guid-a</guid>
+                <comments>https://tracker.example/</comments>
+                <enclosure url='https://prowlarr.invalid/a.torrent'/>
+              </item>
+              <item><title>Shared B</title><guid>guid-b</guid>
+                <comments>https://tracker.example/</comments>
+                <enclosure url='https://prowlarr.invalid/b.torrent'/>
+              </item>
+              <item><title>Normal Detail</title><guid>guid-c</guid>
+                <comments>https://tracker.example/details/c</comments>
+                <enclosure url='https://prowlarr.invalid/c.torrent'/>
+              </item>
+            </channel></rss>"""
+            Request.response = _real_xml_response(xml.encode("utf-8"))
+
+            result = plugin._ProwlarrExtend__parse_torznab_xml(
+                "https://prowlarr.invalid/results",
+                site={"name": "Shared Detail Site"},
+            )
+
+            self.assertEqual(len(result), 3)
+            self.assertIsNone(result[0].page_url)
+            self.assertIsNone(result[1].page_url)
+            self.assertEqual(result[2].page_url, "https://tracker.example/details/c")
+            self.assertEqual(
+                [item.enclosure for item in result[:2]],
+                [
+                    "https://prowlarr.invalid/a.torrent",
+                    "https://prowlarr.invalid/b.torrent",
+                ],
+            )
+
     def test_service_config_and_diagnostics_are_current_v3_contracts(self):
         with loaded_module() as module:
             plugin = object.__new__(module.ProwlarrExtend)
@@ -1146,11 +1204,19 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             plugin._cron = "*/15 * * * *"
             plugin._sync_generation = 3
             plugin._ProwlarrExtend__sync_all = lambda generation=None: generation
-            service = plugin.get_service()[0]
-            self.assertEqual(service["id"], "prowlarr_extend_sync")
-            self.assertEqual(service["func_kwargs"], {"generation": 3})
-            self.assertEqual(service["kwargs"]["max_instances"], 1)
-            self.assertEqual(service["kwargs"]["coalesce"], True)
+            services = plugin.get_service()
+            self.assertEqual(len(services), 2)
+            initial, recurring = services
+            self.assertEqual(initial["id"], "prowlarr_extend_sync_initial")
+            self.assertEqual(initial["trigger"], "date")
+            self.assertEqual(initial["func_kwargs"], {"generation": 3})
+            self.assertIn("run_date", initial["kwargs"])
+            self.assertTrue(initial["kwargs"]["run_date"].tzinfo)
+            self.assertEqual(recurring["id"], "prowlarr_extend_sync")
+            self.assertEqual(recurring["func_kwargs"], {"generation": 3})
+            self.assertEqual(recurring["kwargs"]["max_instances"], 1)
+            self.assertEqual(recurring["kwargs"]["coalesce"], True)
+            self.assertNotIn("_sync_thread", plugin.__dict__)
 
             plugin._host = "https://user:secret@prowlarr.invalid"
             plugin._api_key = "not-a-real-key"
@@ -1508,7 +1574,6 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             plugin = object.__new__(module.ProwlarrExtend)
             plugin._enabled = True
             plugin._sync_stop_event = threading.Event()
-            plugin._sync_thread = None
             commit_entered = threading.Event()
             release_commit = threading.Event()
 
@@ -1535,59 +1600,12 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertFalse(commit_worker.is_alive())
             self.assertFalse(stop_worker.is_alive())
 
-    def test_stop_service_does_not_wait_for_blocked_network_worker(self):
-        with loaded_module() as module:
-            plugin = object.__new__(module.ProwlarrExtend)
-            plugin._enabled = True
-            plugin._sync_stop_event = threading.Event()
-            network_entered = threading.Event()
-            release_network = threading.Event()
-
-            def blocked_network_request():
-                network_entered.set()
-                release_network.wait(2)
-
-            network_worker = threading.Thread(target=blocked_network_request)
-            plugin._sync_thread = network_worker
-            network_worker.start()
-            self.assertTrue(network_entered.wait(2))
-            stop_returned = threading.Event()
-            stop_worker = threading.Thread(
-                target=lambda: (plugin.stop_service(), stop_returned.set()),
-            )
-            stop_worker.start()
-            try:
-                self.assertTrue(stop_returned.wait(1))
-                self.assertFalse(release_network.is_set())
-            finally:
-                release_network.set()
-            stop_worker.join(2)
-            network_worker.join(2)
-            self.assertFalse(stop_worker.is_alive())
-            self.assertFalse(network_worker.is_alive())
-
     def test_host_stop_then_init_preserves_site_identity_and_user_fields(self):
         with loaded_module() as module:
             class FakeCronTrigger:
                 @classmethod
                 def from_crontab(cls, _expression, timezone=None):
                     return cls()
-
-            class FakeThread:
-                def __init__(self, target, kwargs, name, daemon):
-                    self.target = target
-                    self.kwargs = kwargs
-                    self.name = name
-                    self.daemon = daemon
-
-                def start(self):
-                    return None
-
-                def is_alive(self):
-                    return False
-
-                def join(self, timeout=None):
-                    return None
 
             record = types.SimpleNamespace(
                 id=91,
@@ -1619,16 +1637,10 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
             event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
             module.CronTrigger = FakeCronTrigger
-            module.threading = types.SimpleNamespace(
-                Event=threading.Event,
-                Thread=FakeThread,
-                current_thread=threading.current_thread,
-            )
             old_plugin = object.__new__(module.ProwlarrExtend)
             old_plugin._enabled = True
             old_plugin._sync_stop_event = threading.Event()
             old_plugin._sync_generation = 3
-            old_plugin._sync_thread = None
             new_plugin = object.__new__(module.ProwlarrExtend)
 
             with site_oper_modules(FakeSiteOper, EventManager(), event_type):
@@ -1638,6 +1650,13 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                     "host": "https://prowlarr.invalid",
                     "api_key": "key",
                 })
+                services = new_plugin.get_service()
+                self.assertEqual(services[0]["trigger"], "date")
+                self.assertEqual(
+                    services[0]["func_kwargs"],
+                    {"generation": new_plugin._sync_generation},
+                )
+                self.assertNotIn("_sync_thread", new_plugin.__dict__)
                 self.assertTrue(new_plugin._ProwlarrExtend__register_site({
                     "name": "New name",
                     "domain": "prowlarr_extend.7",

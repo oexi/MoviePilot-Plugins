@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
+import inspect
+import json
 from pathlib import Path
 
 import pytest
@@ -45,23 +47,117 @@ def _configure_plugin_runtime() -> None:
     from app.runtime.extensions.plugin.storage import get_plugin_storage
     from app.runtime.extensions.plugin.system import get_plugin_system
 
+    environment_parameters = inspect.signature(PluginRuntimeEnvironment).parameters
+
+    # MoviePilot 新版把源插件本体也纳入实例目录，由 is_enabled 决定是否装载。
+    # 测试仓不应依赖用户数据库中的实例行，因此仅在宿主声明该端口时提供一个
+    # 进程内目录，并把 package.v3.json 中的物理插件本体初始化为启用状态。
+    instance_directory = None
+
+    def _set_default_target(_source_plugin_id: str, _instance_id: str) -> bool:
+        return False
+
+    def _clear_default_target(_source_plugin_id: str) -> None:
+        return None
+
+    if "instance_directory" in environment_parameters:
+        from app.runtime.extensions.plugin.storage import PluginInstanceDirectory
+        from app.schemas.plugin import PluginInstance
+
+        manifest = json.loads((REPO_ROOT / "package.v3.json").read_text(encoding="utf-8"))
+        instance_rows = {
+            plugin_id: PluginInstance(
+                instance_id=plugin_id,
+                source_plugin_id=plugin_id,
+                is_enabled=True,
+            )
+            for plugin_id in manifest
+        }
+
+        def _instance_get(instance_id: str):
+            return instance_rows.get(instance_id)
+
+        def _instance_list_all():
+            return list(instance_rows.values())
+
+        def _instance_list_by_source(source_plugin_id: str):
+            return [
+                row
+                for row in instance_rows.values()
+                if row.source_plugin_id == source_plugin_id
+            ]
+
+        def _instance_save(instance):
+            instance_rows[instance.instance_id] = instance
+
+        def _instance_delete(instance_id: str) -> bool:
+            return instance_rows.pop(instance_id, None) is not None
+
+        def _instance_list_enabled():
+            return [row for row in instance_rows.values() if row.is_enabled]
+
+        def _instance_set_enabled(instance_id: str, is_enabled: bool) -> bool:
+            current = instance_rows.get(instance_id)
+            if current is None:
+                return False
+            instance_rows[instance_id] = current.model_copy(
+                update={"is_enabled": is_enabled}
+            )
+            return True
+
+        instance_directory = PluginInstanceDirectory(
+            get=_instance_get,
+            list_all=_instance_list_all,
+            list_by_source=_instance_list_by_source,
+            save=_instance_save,
+            delete=_instance_delete,
+            list_enabled=_instance_list_enabled,
+            set_enabled=_instance_set_enabled,
+        )
+
+        def _set_default_target(source_plugin_id: str, instance_id: str) -> bool:
+            selected = instance_rows.get(instance_id)
+            if selected is None or selected.source_plugin_id != source_plugin_id:
+                return False
+            for row_id, row in tuple(instance_rows.items()):
+                if row.source_plugin_id == source_plugin_id:
+                    instance_rows[row_id] = row.model_copy(
+                        update={"is_default_target": row_id == instance_id}
+                    )
+            return True
+
+        def _clear_default_target(source_plugin_id: str) -> None:
+            for row_id, row in tuple(instance_rows.items()):
+                if row.source_plugin_id == source_plugin_id and row.is_default_target:
+                    instance_rows[row_id] = row.model_copy(
+                        update={"is_default_target": False}
+                    )
+
     def build_test_plugin_runtime(host):
         """把真实宿主运行时组件指向当前仓库的 V3 源码目录。"""
+        environment_kwargs = {
+            "plugins_root": REPO_ROOT / "plugins.v3",
+            "storage": get_plugin_storage,
+            "system": get_plugin_system,
+            "database": get_plugin_database,
+            "catalog_factory": lambda _mapper: None,
+            "import_preparer": lambda **_kwargs: None,
+            "import_scanner": lambda **_kwargs: None,
+            "auth_level": lambda: 1,
+            "remote_entry": host.get_plugin_remote_entry,
+            "development": lambda: bool(getattr(settings, "DEV", False)),
+            "logger": plugin_manager_module.logger,
+        }
+        if "instance_directory" in environment_parameters:
+            environment_kwargs["instance_directory"] = lambda: instance_directory
+        if "set_default_target" in environment_parameters:
+            environment_kwargs["set_default_target"] = _set_default_target
+        if "clear_default_target" in environment_parameters:
+            environment_kwargs["clear_default_target"] = _clear_default_target
+
         return build_plugin_runtime(
             host,
-            PluginRuntimeEnvironment(
-                plugins_root=REPO_ROOT / "plugins.v3",
-                storage=get_plugin_storage,
-                system=get_plugin_system,
-                database=get_plugin_database,
-                catalog_factory=lambda _mapper: None,
-                import_preparer=lambda **_kwargs: None,
-                import_scanner=lambda **_kwargs: None,
-                auth_level=lambda: 1,
-                remote_entry=host.get_plugin_remote_entry,
-                development=lambda: bool(getattr(settings, "DEV", False)),
-                logger=plugin_manager_module.logger,
-            ),
+            PluginRuntimeEnvironment(**environment_kwargs),
             tool_build_max_attempts=PluginManager.AGENT_TOOLS_BUILD_MAX_ATTEMPTS,
         )
 

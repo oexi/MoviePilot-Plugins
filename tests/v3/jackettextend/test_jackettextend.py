@@ -323,24 +323,29 @@ class JackettV3ContractTest(unittest.TestCase):
 
             services = plugin.get_service()
 
-            self.assertIsInstance(services, list)
-            self.assertEqual(len(services), 1)
-            service = services[0]
-            self.assertTrue(service["id"])
-            self.assertEqual(service["id"], plugin.get_service()[0]["id"])
-            self.assertTrue(service["name"])
-            self.assertIsInstance(service["trigger"], FakeCronTrigger)
-            self.assertEqual(service["trigger"].expression, "*/15 * * * *")
-            self.assertEqual(service["trigger"].timezone, "UTC")
-            self.assertTrue(callable(service["func"]))
-            self.assertEqual(service["func_kwargs"], {"generation": 4})
-            self.assertEqual(service["kwargs"], {
+            self.assertEqual(len(services), 2)
+            initial, recurring = services
+            self.assertEqual(initial["id"], "jackett_extend_sync_initial")
+            self.assertEqual(initial["trigger"], "date")
+            self.assertEqual(initial["func_kwargs"], {"generation": 4})
+            self.assertIn("run_date", initial["kwargs"])
+            self.assertEqual(initial["kwargs"]["misfire_grace_time"], 60)
+            self.assertTrue(initial["kwargs"]["run_date"].tzinfo)
+
+            self.assertEqual(recurring["id"], "jackett_extend_sync")
+            self.assertIsInstance(recurring["trigger"], FakeCronTrigger)
+            self.assertEqual(recurring["trigger"].expression, "*/15 * * * *")
+            self.assertEqual(recurring["trigger"].timezone, "UTC")
+            self.assertTrue(callable(recurring["func"]))
+            self.assertEqual(recurring["func_kwargs"], {"generation": 4})
+            self.assertEqual(recurring["kwargs"], {
                 "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 3600,
             })
-            service["func"](**service["func_kwargs"])
-            self.assertEqual(calls, [4])
+            initial["func"](**initial["func_kwargs"])
+            recurring["func"](**recurring["func_kwargs"])
+            self.assertEqual(calls, [4, 4])
 
             plugin._enabled = False
             self.assertEqual(plugin.get_service(), [])
@@ -1466,6 +1471,46 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertEqual(result[0].category, "音乐")
             self.assertEqual(_RequestUtils.timeouts[-1], 12)
 
+    def test_parser_clears_shared_page_url_for_distinct_torrents(self):
+        with loaded_module() as module:
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = """<?xml version='1.0'?><rss><channel>
+              <item><title>Bangumi A</title><guid>guid-a</guid>
+                <comments>https://bangumi.example/</comments>
+                <enclosure url='https://jackett.invalid/a.torrent'/>
+              </item>
+              <item><title>Bangumi B</title><guid>guid-b</guid>
+                <comments>https://bangumi.example/</comments>
+                <enclosure url='https://jackett.invalid/b.torrent'/>
+              </item>
+              <item><title>Normal Detail</title><guid>guid-c</guid>
+                <comments>https://tracker.example/details/c</comments>
+                <enclosure url='https://jackett.invalid/c.torrent'/>
+              </item>
+            </channel></rss>"""
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "Bangumi Moe"},
+            )
+
+            self.assertEqual(len(result), 3)
+            self.assertIsNone(result[0].page_url)
+            self.assertIsNone(result[1].page_url)
+            self.assertEqual(result[2].page_url, "https://tracker.example/details/c")
+            self.assertEqual(
+                [item.enclosure for item in result[:2]],
+                [
+                    "https://jackett.invalid/a.torrent",
+                    "https://jackett.invalid/b.torrent",
+                ],
+            )
+
     def test_parser_prefers_raw_content_when_text_guess_conflicts_with_xml_encoding(self):
         with loaded_module() as module:
             title = "Café release"
@@ -2550,7 +2595,6 @@ class JackettSyncBoundaryTest(unittest.TestCase):
             plugin = object.__new__(module.JackettExtend)
             plugin._enabled = True
             plugin._sync_stop_event = threading.Event()
-            plugin._sync_thread = None
             commit_entered = threading.Event()
             release_commit = threading.Event()
 
@@ -2577,59 +2621,12 @@ class JackettSyncBoundaryTest(unittest.TestCase):
             self.assertFalse(commit_worker.is_alive())
             self.assertFalse(stop_worker.is_alive())
 
-    def test_stop_service_does_not_wait_for_blocked_network_worker(self):
-        with loaded_module() as module:
-            plugin = object.__new__(module.JackettExtend)
-            plugin._enabled = True
-            plugin._sync_stop_event = threading.Event()
-            network_entered = threading.Event()
-            release_network = threading.Event()
-
-            def blocked_network_request():
-                network_entered.set()
-                release_network.wait(2)
-
-            network_worker = threading.Thread(target=blocked_network_request)
-            plugin._sync_thread = network_worker
-            network_worker.start()
-            self.assertTrue(network_entered.wait(2))
-            stop_returned = threading.Event()
-            stop_worker = threading.Thread(
-                target=lambda: (plugin.stop_service(), stop_returned.set()),
-            )
-            stop_worker.start()
-            try:
-                self.assertTrue(stop_returned.wait(1))
-                self.assertFalse(release_network.is_set())
-            finally:
-                release_network.set()
-            stop_worker.join(2)
-            network_worker.join(2)
-            self.assertFalse(stop_worker.is_alive())
-            self.assertFalse(network_worker.is_alive())
-
     def test_host_stop_then_init_preserves_site_identity_and_user_fields(self):
         with loaded_module() as module:
             class FakeCronTrigger:
                 @classmethod
                 def from_crontab(cls, _expression, timezone=None):
                     return cls()
-
-            class FakeThread:
-                def __init__(self, target, kwargs, name, daemon):
-                    self.target = target
-                    self.kwargs = kwargs
-                    self.name = name
-                    self.daemon = daemon
-
-                def start(self):
-                    return None
-
-                def is_alive(self):
-                    return False
-
-                def join(self, timeout=None):
-                    return None
 
             record = types.SimpleNamespace(
                 id=91,
@@ -2661,16 +2658,10 @@ class JackettSyncBoundaryTest(unittest.TestCase):
 
             event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
             module.CronTrigger = FakeCronTrigger
-            module.threading = types.SimpleNamespace(
-                Event=threading.Event,
-                Thread=FakeThread,
-                current_thread=threading.current_thread,
-            )
             old_plugin = object.__new__(module.JackettExtend)
             old_plugin._enabled = True
             old_plugin._sync_stop_event = threading.Event()
             old_plugin._sync_generation = 3
-            old_plugin._sync_thread = None
             new_plugin = object.__new__(module.JackettExtend)
 
             with site_oper_modules(FakeSiteOper, EventManager(), event_type):
@@ -2703,39 +2694,14 @@ class JackettSyncBoundaryTest(unittest.TestCase):
                 },
             )])
 
-    def test_reload_uses_real_stop_and_replaces_generation_event(self):
+    def test_reload_replaces_generation_event_without_plugin_owned_worker(self):
         with loaded_module() as module:
             class FakeCronTrigger:
                 @classmethod
                 def from_crontab(cls, expression, timezone=None):
                     return cls()
 
-            created = []
-
-            class FakeThread:
-                def __init__(self, target, kwargs, name, daemon):
-                    self.target = target
-                    self.kwargs = kwargs
-                    self.name = name
-                    self.daemon = daemon
-                    self.started = False
-                    created.append(self)
-
-                def start(self):
-                    self.started = True
-
-                def is_alive(self):
-                    return False
-
-                def join(self, timeout=None):
-                    return None
-
             module.CronTrigger = FakeCronTrigger
-            module.threading = types.SimpleNamespace(
-                Event=threading.Event,
-                Thread=FakeThread,
-                current_thread=threading.current_thread,
-            )
             plugin = object.__new__(module.JackettExtend)
             cleanup_calls = []
             plugin._JackettExtend__remove_managed_sites = lambda: cleanup_calls.append(True)
@@ -2747,9 +2713,10 @@ class JackettSyncBoundaryTest(unittest.TestCase):
             })
             first_event = plugin._sync_stop_event
             first_generation = plugin._sync_generation
-            self.assertEqual(len(created), 1)
-            self.assertTrue(created[0].started)
-            self.assertEqual(created[0].kwargs, {"generation": first_generation})
+            first_services = plugin.get_service()
+            self.assertEqual(first_services[0]["trigger"], "date")
+            self.assertEqual(first_services[0]["func_kwargs"], {"generation": first_generation})
+            self.assertNotIn("_sync_thread", plugin.__dict__)
 
             plugin.init_plugin({
                 "enabled": True,
@@ -2762,9 +2729,10 @@ class JackettSyncBoundaryTest(unittest.TestCase):
             self.assertTrue(first_event.is_set())
             self.assertIsNot(first_event, second_event)
             self.assertGreaterEqual(second_generation, first_generation + 2)
-            self.assertEqual(len(created), 2)
-            self.assertTrue(created[1].started)
-            self.assertEqual(created[1].kwargs, {"generation": second_generation})
+            second_services = plugin.get_service()
+            self.assertEqual(second_services[0]["trigger"], "date")
+            self.assertEqual(second_services[0]["func_kwargs"], {"generation": second_generation})
+            self.assertNotIn("_sync_thread", plugin.__dict__)
             self.assertEqual(cleanup_calls, [])
 
             plugin.stop_service()

@@ -1,5 +1,6 @@
 # _*_ coding: utf-8 _*_
 import asyncio
+import datetime
 import copy
 import json
 import math
@@ -16,7 +17,12 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.sdk.media import TorrentInfo
 from app.sdk.logging import logger
-from app.plugins import _PluginBase
+try:
+    from app.sdk.plugin import _PluginBase
+except (ImportError, AttributeError):
+    # MoviePilot V3 before the SDK namespace migration exposed the base class
+    # from the legacy app.plugins package.
+    from app.plugins import _PluginBase
 from app.sdk.config import settings
 from app.schemas import MediaType
 from app.schemas.types import MediaSource
@@ -27,6 +33,7 @@ from ._torznab import (
     classify_torznab_response,
     contains_xml_dtd,
     extract_torznab_item,
+    find_ambiguous_torznab_page_urls,
     redact_url,
     safe_count,
     safe_float,
@@ -59,7 +66,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.20"
+    plugin_version = "3.2.21"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -119,7 +126,6 @@ class JackettExtend(_PluginBase):
     # config persistence (which is itself a commit) safe when called from a
     # synchronization commit.
     _sync_lock = threading.RLock()
-    _sync_thread = None
     _sync_stop_event = None
     _sync_generation = 0
 
@@ -201,7 +207,6 @@ class JackettExtend(_PluginBase):
                 # A fresh generation makes prior scheduler callbacks harmless
                 # even if a host cannot cancel a callback already queued.
                 self._sync_generation += 1
-                generation = self._sync_generation
                 self._sync_stop_event = threading.Event()
 
             # 读取配置.  Keep assignment under the same state lock as
@@ -257,8 +262,8 @@ class JackettExtend(_PluginBase):
         )
 
         # Validate the cron expression here so the shared host scheduler only
-        # ever receives a known-good trigger.  The initial synchronization is
-        # still detached from plugin startup below.
+        # ever receives a known-good recurring trigger.  get_service() also
+        # exposes a one-shot date trigger for the initial synchronization.
         cron_expr = self._cron or "0 0 * * *"
         logger.info(f"【{self.plugin_name}】 索引更新服务启用，周期：{cron_expr}")
         try:
@@ -269,16 +274,9 @@ class JackettExtend(_PluginBase):
                 f"【{self.plugin_name}】cron 表达式无效：{cron_expr!r}，已回退为默认 '0 0 * * *'：{type(e).__name__}：{str(e)}")
             with self._state_lock:
                 self._cron = "0 0 * * *"
-        # Initial synchronization is deliberately detached from plugin
-        # startup.  The first successful, non-empty authoritative snapshot is
-        # required before any stale selection/site cleanup is allowed.
-        self._sync_thread = threading.Thread(
-            target=self.__sync_all,
-            kwargs={"generation": generation},
-            name=f"{self._service_id()}-initial",
-            daemon=True,
-        )
-        self._sync_thread.start()
+        # Initial synchronization is registered as a one-shot MoviePilot
+        # scheduler service in get_service().  Keeping all background work under
+        # the host scheduler avoids plugin-owned daemon threads during reload/stop.
 
     @classmethod
     def _normalize_timeout(cls, value: object) -> int:
@@ -659,19 +657,35 @@ class JackettExtend(_PluginBase):
                     f"【{self.plugin_name}】cron 表达式无效：{cron_expr!r}，已回退为默认 '0 0 * * *'：{type(e).__name__}：{str(e)}")
                 self._cron = "0 0 * * *"
                 trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
-            # H2: max_instances=1 + coalesce=True，避免同步回调并发操作。
-            return [{
-                "id": self._service_id(),
-                "name": f"{self.plugin_name} indexer sync",
-                "trigger": trigger,
-                "func": self.__sync_all,
-                "func_kwargs": {"generation": generation},
-                "kwargs": {
-                    "max_instances": 1,
-                    "coalesce": True,
-                    "misfire_grace_time": 3600,
+            # Keep both the one-shot initial sync and recurring refresh under
+            # MoviePilot's scheduler.  This avoids plugin-owned daemon workers
+            # and lets the host own cancellation/reload semantics.
+            initial_run_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+            return [
+                {
+                    "id": f"{self._service_id()}_initial",
+                    "name": f"{self.plugin_name} initial indexer sync",
+                    "trigger": "date",
+                    "func": self.__sync_all,
+                    "func_kwargs": {"generation": generation},
+                    "kwargs": {
+                        "run_date": initial_run_at,
+                        "misfire_grace_time": 60,
+                    },
                 },
-            }]
+                {
+                    "id": self._service_id(),
+                    "name": f"{self.plugin_name} indexer sync",
+                    "trigger": trigger,
+                    "func": self.__sync_all,
+                    "func_kwargs": {"generation": generation},
+                    "kwargs": {
+                        "max_instances": 1,
+                        "coalesce": True,
+                        "misfire_grace_time": 3600,
+                    },
+                },
+            ]
 
     def _stop_runtime(self):
         """Stop runtime resources without deleting persisted site rows."""
@@ -684,19 +698,16 @@ class JackettExtend(_PluginBase):
             event.set()
         with self._state_lock:
             self._sync_generation += 1
-        thread = getattr(self, "_sync_thread", None)
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            # Do not make reload wait for a network timeout; the worker checks
-            # the generation/event before every state-changing operation.
-            thread.join(timeout=0.2)
-        self._sync_thread = None
+        # All synchronization callbacks are scheduler-owned.  Invalidating
+        # the generation/event is enough to make an already-dispatched callback
+        # harmless at its next side-effect boundary.
+        return True
 
     def stop_service(self):
         """Stop runtime resources while preserving persisted site rows."""
         self._stop_runtime()
-        # Drain only the short DB/event commit phase.  Network fetches happen
-        # before workers acquire this lock, so the bounded join above remains
-        # the only wait on an in-flight network request.
+        # Drain the short DB/event commit phase.  Network callbacks are owned by
+        # MoviePilot's scheduler and stale generations cannot commit afterwards.
         with self._sync_lock:
             with self._state_lock:
                 self._enabled = False
@@ -1051,17 +1062,32 @@ class JackettExtend(_PluginBase):
             **kwargs,
         )
 
-    async def async_refresh_torrents(self, site: dict, keyword: str = None,
-                                      mtype: Optional[MediaType] = None,
-                                      cat: Optional[str] = None,
-                                      page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
-        """Async refresh counterpart; it shares the same thread-bound search."""
-        return await self.async_search_torrents(
+    def refresh_torrents(self, site: dict, keyword: str = None,
+                         cat: Optional[str] = None,
+                         page: Optional[int] = 0,
+                         mtype: Optional[MediaType] = None, **kwargs) -> List[TorrentInfo]:
+        """Refresh one owned site using the current MoviePilot contract."""
+        return self.search_torrents(
             site=site,
             keyword=keyword,
             mtype=mtype,
             cat=cat,
             page=page,
+            **kwargs,
+        )
+
+    async def async_refresh_torrents(self, site: dict, keyword: str = None,
+                                      cat: Optional[str] = None,
+                                      page: Optional[int] = 0,
+                                      mtype: Optional[MediaType] = None, **kwargs) -> List[TorrentInfo]:
+        """Async refresh counterpart; it shares the same thread-bound search."""
+        return await asyncio.to_thread(
+            self.refresh_torrents,
+            site=site,
+            keyword=keyword,
+            cat=cat,
+            page=page,
+            mtype=mtype,
             **kwargs,
         )
 
@@ -1288,21 +1314,32 @@ class JackettExtend(_PluginBase):
             "id2": self.xxx2,
         }
         """
-        # V3 适配：V3 搜索链走异步模块(async_search_torrents)，必须一并注册
-        def _wrapped_search(*args, **kwargs):
-            return self.search_torrents(*args, **kwargs)
+        def module_search_torrents(site, keyword=None, mtype=None, page=0):
+            return self.search_torrents(
+                site=site, keyword=keyword, mtype=mtype, page=page
+            )
 
-        async def _wrapped_async_search(*args, **kwargs):
-            return await self.async_search_torrents(*args, **kwargs)
+        async def module_async_search_torrents(site, keyword=None, mtype=None, page=0):
+            return await self.async_search_torrents(
+                site=site, keyword=keyword, mtype=mtype, page=page
+            )
 
-        async def _wrapped_async_refresh(*args, **kwargs):
-            return await self.async_refresh_torrents(*args, **kwargs)
+        def module_refresh_torrents(site, keyword=None, cat=None, page=0, mtype=None):
+            return self.refresh_torrents(
+                site=site, keyword=keyword, cat=cat, page=page, mtype=mtype
+            )
+
+        async def module_async_refresh_torrents(
+                site, keyword=None, cat=None, page=0, mtype=None):
+            return await self.async_refresh_torrents(
+                site=site, keyword=keyword, cat=cat, page=page, mtype=mtype
+            )
 
         return {
-            "search_torrents": _wrapped_search,
-            "async_search_torrents": _wrapped_async_search,
-            "refresh_torrents": _wrapped_search,
-            "async_refresh_torrents": _wrapped_async_refresh,
+            "search_torrents": module_search_torrents,
+            "async_search_torrents": module_async_search_torrents,
+            "refresh_torrents": module_refresh_torrents,
+            "async_refresh_torrents": module_async_refresh_torrents,
             "get_search_page_size": self.get_search_page_size,
         }
 
@@ -1639,6 +1676,25 @@ class JackettExtend(_PluginBase):
                     f"【{self.plugin_name}】torznab item 解析失败,已跳过：url={log_url}, "
                     f"类型={type(e).__name__}")
                 continue
+
+        ambiguous_page_urls = find_ambiguous_torznab_page_urls([
+            (
+                getattr(torrent, "page_url", None),
+                getattr(torrent, "enclosure", None),
+            )
+            for torrent in torrents
+        ])
+        if ambiguous_page_urls:
+            cleared = 0
+            for torrent in torrents:
+                page_url = str(getattr(torrent, "page_url", None) or "").strip()
+                if page_url in ambiguous_page_urls:
+                    torrent.page_url = None
+                    cleared += 1
+            logger.debug(
+                f"【{self.plugin_name}】检测到 {len(ambiguous_page_urls)} 个共享详情页 URL，"
+                f"已清理 {cleared} 条资源的 page_url，避免宿主资源列表误去重"
+            )
 
         return torrents
 

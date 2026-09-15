@@ -150,6 +150,24 @@ class ProwlarrTorznabHelperTest(unittest.TestCase):
         self.assertIn("apikey=%2A%2A%2A", redacted)
         self.assertIn("cat=2000", redacted)
 
+    def test_shared_page_url_is_ambiguous_only_for_distinct_downloads(self):
+        shared = "https://tracker.invalid/"
+        self.assertEqual(
+            TORZNAB.find_ambiguous_torznab_page_urls([
+                (shared, "https://tracker.invalid/a.torrent"),
+                (shared, "https://tracker.invalid/b.torrent"),
+                ("https://tracker.invalid/detail/c", "https://tracker.invalid/c.torrent"),
+            ]),
+            {shared},
+        )
+        self.assertEqual(
+            TORZNAB.find_ambiguous_torznab_page_urls([
+                (shared, "https://tracker.invalid/a.torrent"),
+                (shared, "https://tracker.invalid/a.torrent"),
+            ]),
+            set(),
+        )
+
 
 class ProwlarrUiHelperTest(unittest.TestCase):
     def test_form_has_current_configuration_only_and_prewires_port(self):

@@ -8,6 +8,7 @@ from ._torznab_core import (
     classify_torznab_response,
     contains_xml_dtd,
     extract_torznab_item,
+    find_ambiguous_torznab_page_urls,
     is_http_torznab_url,
     is_usable_torznab_response,
     normalize_imdbid,

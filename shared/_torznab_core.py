@@ -320,6 +320,34 @@ def select_torznab_identity(
     return "enclosure", str(enclosure or "").strip().lower()
 
 
+def find_ambiguous_torznab_page_urls(pairs: object) -> set[str]:
+    """Return shared page URLs that point at more than one download resource.
+
+    Some indexers expose a site/home page in ``comments`` for every item.
+    MoviePilot's resource browser may use ``page_url`` as an item identity, so
+    retaining such a shared URL can collapse otherwise distinct torrents into
+    one visible row.  Only exact shared URLs backed by multiple distinct
+    enclosures are considered ambiguous; normal per-release detail URLs are
+    untouched.
+    """
+    if not isinstance(pairs, (list, tuple)):
+        return set()
+    grouped: dict[str, set[str]] = {}
+    for value in pairs:
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            continue
+        page_url = str(value[0] or "").strip()
+        enclosure = str(value[1] or "").strip()
+        if not page_url or not enclosure:
+            continue
+        grouped.setdefault(page_url, set()).add(enclosure)
+    return {
+        page_url
+        for page_url, enclosures in grouped.items()
+        if len(enclosures) > 1
+    }
+
+
 def is_http_torznab_url(value: object) -> bool:
     """Return whether a value is a valid HTTP(S) URL."""
     return bool(_supported_url(value, ("http", "https")))

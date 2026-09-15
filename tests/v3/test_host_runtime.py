@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
+from importlib import import_module
 
 import pytest
 from fastapi import FastAPI
@@ -23,6 +25,43 @@ PLUGIN_CASES = (
     ("JackettExtend", "jackettextend"),
     ("ProwlarrExtend", "prowlarrextend"),
 )
+
+
+@pytest.mark.parametrize("plugin_id, module_id", PLUGIN_CASES)
+def test_plugins_use_sdk_base_and_explicit_module_contracts(
+    plugin_id: str,
+    module_id: str,
+) -> None:
+    """插件优先使用 SDK 基类，模块 provider 不暴露动态 varargs。"""
+    del plugin_id
+    module = import_module(f"app.plugins.{module_id}")
+    sdk_base = import_module("app.sdk.plugin")._PluginBase
+    plugin_class = getattr(module, "JackettExtend" if module_id == "jackettextend" else "ProwlarrExtend")
+
+    assert plugin_class.__bases__[0] is sdk_base
+
+    plugin = object.__new__(plugin_class)
+    module_methods = plugin.get_module()
+    expected_parameters = {
+        "search_torrents": ("site", "keyword", "mtype", "page"),
+        "refresh_torrents": ("site", "keyword", "cat", "page", "mtype"),
+        "get_search_page_size": ("site", "keyword"),
+    }
+    from app.runtime.extensions.module.contracts import diagnose_module_callable
+
+    for method, required in expected_parameters.items():
+        callback = module_methods[method]
+        parameters = tuple(inspect.signature(callback).parameters.values())
+        assert not any(
+            parameter.kind
+            in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            for parameter in parameters
+        )
+        assert set(required).issubset({parameter.name for parameter in parameters})
+        assert diagnose_module_callable(method, callback) == ()
+
+    assert inspect.iscoroutinefunction(module_methods["async_search_torrents"])
+    assert inspect.iscoroutinefunction(module_methods["async_refresh_torrents"])
 
 
 def _route_paths(app: FastAPI, suffix: str) -> list[str]:

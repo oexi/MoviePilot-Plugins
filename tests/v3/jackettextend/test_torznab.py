@@ -252,6 +252,24 @@ class TorznabPureParsingTest(unittest.TestCase):
         self.assertFalse(MODULE.should_replace_torznab_duplicate(direct, magnet))
         self.assertFalse(MODULE.should_replace_torznab_duplicate(magnet, magnet))
 
+    def test_shared_page_url_is_ambiguous_only_for_distinct_downloads(self):
+        shared = "https://tracker.invalid/"
+        self.assertEqual(
+            MODULE.find_ambiguous_torznab_page_urls([
+                (shared, "https://tracker.invalid/a.torrent"),
+                (shared, "https://tracker.invalid/b.torrent"),
+                ("https://tracker.invalid/detail/c", "https://tracker.invalid/c.torrent"),
+            ]),
+            {shared},
+        )
+        self.assertEqual(
+            MODULE.find_ambiguous_torznab_page_urls([
+                (shared, "https://tracker.invalid/a.torrent"),
+                (shared, "https://tracker.invalid/a.torrent"),
+            ]),
+            set(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

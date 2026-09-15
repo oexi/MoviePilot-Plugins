@@ -252,17 +252,25 @@ def test_same_plugin_clones_keep_bridge_sites_and_services_isolated(
                 chain.async_search_site_torrents(profile, "title")
             ) == [label]
 
-        service_ids = []
+        initial_service_ids = []
+        recurring_service_ids = []
         for plugin_class in classes:
             service_instance = object.__new__(plugin_class)
             service_instance._enabled = True
             service_instance._cron = "0 0 * * *"
-            service_id = service_instance.get_service()[0]["id"]
-            assert service_id
-            assert service_id == service_instance.get_service()[0]["id"]
-            service_ids.append(service_id)
-        assert len(set(service_ids)) == 3
-        assert service_ids[1:] == [
+            initial, recurring = service_instance.get_service()
+            assert initial["trigger"] == "date"
+            assert initial["id"] == service_instance.get_service()[0]["id"]
+            assert recurring["id"] == service_instance.get_service()[1]["id"]
+            initial_service_ids.append(initial["id"])
+            recurring_service_ids.append(recurring["id"])
+        assert len(set(initial_service_ids)) == 3
+        assert len(set(recurring_service_ids)) == 3
+        assert initial_service_ids[1:] == [
+            f"{plugin_class._runtime_instance_id().lower()}_sync_initial"
+            for plugin_class in clone_classes
+        ]
+        assert recurring_service_ids[1:] == [
             f"{plugin_class._runtime_instance_id().lower()}_sync"
             for plugin_class in clone_classes
         ]
@@ -353,28 +361,13 @@ def test_clone_init_binds_runtime_owner_without_starting_network(
         plugin_dir,
         instance_id,
         monkeypatch):
-    """分身初始化把 bridge、线程和服务标识绑定到运行类名。"""
+    """分身初始化把 bridge 与宿主调度服务标识绑定到运行类名。"""
     loader, source_class, clone_classes = _load_classes(plugin_dir, (instance_id,))
     del source_class
     clone_class = clone_classes[0]
     module = import_module(clone_class.__module__)
     calls = []
 
-    class FakeThread:
-        def __init__(self, target, kwargs, name, daemon):
-            self.target = target
-            self.kwargs = kwargs
-            self.name = name
-            self.daemon = daemon
-
-        def start(self):
-            pass
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            del timeout
 
     try:
         monkeypatch.setattr(module, "SitesHelper", lambda: object())
@@ -388,16 +381,6 @@ def test_clone_init_binds_runtime_owner_without_starting_network(
             "uninstall",
             lambda *args, **kwargs: calls.append(("uninstall", args, kwargs)) or True,
         )
-        monkeypatch.setattr(
-            module,
-            "threading",
-            SimpleNamespace(
-                Event=threading.Event,
-                Thread=FakeThread,
-                current_thread=threading.current_thread,
-            ),
-        )
-
         plugin = object.__new__(clone_class)
         plugin.init_plugin({
             "enabled": True,
@@ -408,8 +391,11 @@ def test_clone_init_binds_runtime_owner_without_starting_network(
         assert plugin._bridge_owner_key == instance_id
         install_call = next(call for call in calls if call[0] == "install")
         assert install_call[2]["owner_key"] == instance_id
-        assert plugin._sync_thread.name == f"{instance_id.lower()}_sync-initial"
-        assert plugin.get_service()[0]["id"] == f"{instance_id.lower()}_sync"
+        assert "_sync_thread" not in plugin.__dict__
+        initial, recurring = plugin.get_service()
+        assert initial["trigger"] == "date"
+        assert initial["id"] == f"{instance_id.lower()}_sync_initial"
+        assert recurring["id"] == f"{instance_id.lower()}_sync"
 
         assert plugin.stop_service()
         uninstall_call = next(call for call in calls if call[0] == "uninstall")
