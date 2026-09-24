@@ -68,7 +68,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -807,7 +807,12 @@ class ProwlarrExtend(_PluginBase):
             if exists:
                 # B1: 更新分支只同步 name/url/public 来源字段,
                 # 保留 is_active/pri/proxy 等用户站点设置不被 cron 覆盖
-                site_registry.update(exists.id, {"name": name, "url": url, "public": public})
+                source_fields = {"name": name, "url": url, "public": public}
+                if self._site_source_fields_match(exists, source_fields):
+                    # 宿主 SiteUpdated 只触发图标抓取、站点配置清理和用户数据刷新，
+                    # 虚拟站点来源字段未变化时不重复写库或通知，避免每轮同步产生无效请求。
+                    return True
+                site_registry.update(exists.id, source_fields)
                 logger.info(f"【{self.plugin_name}】已更新站点记录: {domain}")
             else:
                 # 新增才写入默认启停/优先级/代理
@@ -839,7 +844,7 @@ class ProwlarrExtend(_PluginBase):
                         raise
                     site_registry.update(existing.id, {"name": name, "url": url, "public": public})
                     logger.debug(f"【{self.plugin_name}】站点已存在(并发注册),转为更新: {domain}, {type(e).__name__}")
-            # 通知宿主刷新站点缓存
+            # 与宿主新增/修改站点接口一致，站点行变化后发送 SiteUpdated
             try:
                 site_registry.notify_updated(domain)
             except Exception as e:
@@ -849,6 +854,15 @@ class ProwlarrExtend(_PluginBase):
         except Exception as e:
             logger.error(f"【{self.plugin_name}】注册站点 {domain} 到 DB 失败: {type(e).__name__}")
             return False
+
+    @staticmethod
+    def _site_source_fields_match(site: object, fields: dict) -> bool:
+        """Whether a persisted row already carries the plugin-owned fields."""
+        return (
+            str(getattr(site, "name", "") or "") == fields["name"]
+            and str(getattr(site, "url", "") or "") == fields["url"]
+            and (1 if getattr(site, "public", 0) == 1 else 0) == fields["public"]
+        )
 
     def _parse_indexer_sites(self) -> list:
         """
@@ -1084,14 +1098,19 @@ class ProwlarrExtend(_PluginBase):
                          cat: Optional[str] = None,
                          page: Optional[int] = 0,
                          mtype: Optional[MediaType] = None, **kwargs) -> List[TorrentInfo]:
-        """Refresh one owned site, distinguishing upstream failure from empty."""
+        """Refresh one owned site for the host's synchronous refresh loop.
+
+        宿主订阅刷新（spider 模式）经 ``TorrentsChain.refresh`` 逐站同步调用本入口，
+        该循环没有逐站异常隔离；上游失败在这里按空结果收敛，避免单个 indexer
+        故障中断全部站点的刷新与订阅匹配。
+        """
         return self._search_torrents(
             site=site,
             keyword=keyword,
             mtype=mtype,
             cat=cat,
             page=page,
-            propagate_upstream_error=True,
+            propagate_upstream_error=False,
         )
 
     async def async_search_torrents(self, site: dict, keyword: str = None,
@@ -1113,15 +1132,19 @@ class ProwlarrExtend(_PluginBase):
                                       cat: Optional[str] = None,
                                       page: Optional[int] = 0,
                                       mtype: Optional[MediaType] = None, **kwargs) -> List[TorrentInfo]:
-        """Run the dedicated refresh boundary off the event loop."""
+        """Browse one owned site, distinguishing upstream failure from empty.
+
+        当前宿主只有站点资源浏览接口走异步刷新入口，因此仅在这里传播脱敏的
+        上游失败，让浏览页区分"站点无资源"和"Prowlarr 请求失败"。
+        """
         return await asyncio.to_thread(
-            self.refresh_torrents,
+            self._search_torrents,
             site=site,
             keyword=keyword,
+            mtype=mtype,
             cat=cat,
             page=page,
-            mtype=mtype,
-            **kwargs,
+            propagate_upstream_error=True,
         )
 
     def get_search_page_size(self, site: dict, keyword: str = None) -> Optional[int]:
@@ -1232,9 +1255,13 @@ class ProwlarrExtend(_PluginBase):
 
         try:
             indexer_query_url = f"{host}/api/v1/indexer"
-            with RequestUtils(headers=headers, timeout=timeout).get_stream(
-                indexer_query_url,
+            # 代理交给构造参数，宿主才会对代理下的 HTTPS 幂等请求启用 TLS 1.2 回退。
+            with RequestUtils(
+                headers=headers,
                 proxies=getattr(settings, "PROXY", None) if proxy else None,
+                timeout=timeout,
+            ).get_stream(
+                indexer_query_url,
                 raise_exception=True,
             ) as ret:
                 # E3: 校验状态码/Content-Type/数据类型,json 只解析一次
@@ -1485,9 +1512,12 @@ class ProwlarrExtend(_PluginBase):
                 "X-Api-Key": str(request_config.get("api_key") or ""),
                 "Accept": "application/xml, application/rss+xml, text/xml, */*",
             }
-            with RequestUtils(headers=headers, timeout=request_timeout).get_stream(
-                url,
+            with RequestUtils(
+                headers=headers,
                 proxies=getattr(settings, "PROXY", None) if request_proxy else None,
+                timeout=request_timeout,
+            ).get_stream(
+                url,
                 raise_exception=True,
             ) as ret:
                 if ret is None:

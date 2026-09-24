@@ -6,7 +6,7 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
 ### JackettExtend
 
-- **版本**：3.2.20
+- **版本**：3.2.22
 - **适用版本**：MoviePilot V3
 - **功能**：
   - 同步 Jackett 中已配置的 indexer，并在 MoviePilot 中生成对应站点
@@ -18,7 +18,7 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
 ### ProwlarrExtend
 
-- **版本**：1.0.7
+- **版本**：1.0.9
 - **适用版本**：MoviePilot V3
 - **功能**：
   - 同步 Prowlarr 中已启用且支持搜索的 Torrent indexer，并在 MoviePilot 中生成对应站点

@@ -183,7 +183,7 @@ def loaded_module():
 def _uninstall_loaded_plugin_bridge(module) -> None:
     """回收该生产模块在宿主 ChainBase 上留下的桥接 owner。"""
     try:
-        from app.chain import ChainBase
+        from app.sdk.chain import ChainBase
 
         compat = module._host_compat
         state = getattr(ChainBase, compat._STATE_ATTR, None)
@@ -1471,6 +1471,57 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertEqual(result[0].category, "音乐")
             self.assertEqual(_RequestUtils.timeouts[-1], 12)
 
+    def test_requests_pass_proxy_to_request_utils_constructor(self):
+        with loaded_module() as module:
+            proxy = {"https": "http://proxy.invalid"}
+            module.settings.PROXY = proxy
+            calls = []
+            json_response = _Response()
+            json_response.headers = {"Content-Type": "application/json"}
+            json_response.text = "[]"
+            xml_response = _Response()
+            xml_response.text = "<rss><channel></channel></rss>"
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    calls.append(("init", kwargs))
+
+                def get_stream(self, url, **kwargs):
+                    calls.append(("get_stream", kwargs))
+                    return _stream_response(
+                        json_response if "/api/v2.0/indexers?" in url else xml_response
+                    )
+
+            module.RequestUtils = Request
+            plugin = object.__new__(module.JackettExtend)
+            plugin._state_lock = module.JackettExtend._state_lock
+            snapshot = {
+                "host": "https://jackett.invalid",
+                "api_key": "not-a-real-key",
+                "password": "",
+                "proxy": True,
+                "timeout": 12,
+            }
+
+            self.assertEqual(
+                plugin._JackettExtend__fetch_indexers(config_snapshot=snapshot),
+                [],
+            )
+            plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results?apikey=secret",
+                site={"id": 3, "name": "Nyaa"},
+                config_snapshot=snapshot,
+            )
+
+            # MoviePilot only applies its proxied-HTTPS TLS 1.2 fallback to
+            # proxies configured on the RequestUtils instance.
+            inits = [kwargs for kind, kwargs in calls if kind == "init"]
+            streams = [kwargs for kind, kwargs in calls if kind == "get_stream"]
+            self.assertEqual(len(inits), 2)
+            self.assertTrue(all(kwargs["proxies"] == proxy for kwargs in inits))
+            self.assertTrue(all("proxies" not in kwargs for kwargs in streams))
+            self.assertEqual(inits[1]["headers"]["User-Agent"], "test")
+
     def test_parser_clears_shared_page_url_for_distinct_torrents(self):
         with loaded_module() as module:
             _RequestUtils.response = _Response()
@@ -2223,6 +2274,49 @@ class JackettSyncBoundaryTest(unittest.TestCase):
                 events.calls,
                 [("SiteUpdated", {"domain": "jackett_extend.nyaa"})],
             )
+
+    def test_register_site_skips_unchanged_row_without_site_updated(self):
+        with loaded_module() as module:
+            existing = types.SimpleNamespace(
+                id=41,
+                domain="jackett_extend.nyaa",
+                name="Nyaa",
+                url="https://jackett_extend.nyaa/",
+                public=1,
+            )
+            state = types.SimpleNamespace(updates=[])
+
+            class FakeSiteOper:
+                def get_by_domain(self, _domain):
+                    return existing
+
+                def update(self, site_id, payload):
+                    state.updates.append((site_id, payload))
+
+                def add(self, **_payload):
+                    raise AssertionError("existing rows must not use add")
+
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            plugin = self._active_plugin(module)
+
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+            ):
+                result = plugin._JackettExtend__register_site({
+                    "name": "Nyaa",
+                    "domain": "jackett_extend.nyaa",
+                    "public": True,
+                    "proxy": False,
+                }, generation=1)
+
+            # Host SiteUpdated listeners only fetch icons/userdata; an
+            # unchanged virtual row must not trigger them on every sync.
+            self.assertTrue(result)
+            self.assertEqual(state.updates, [])
+            self.assertEqual(events.calls, [])
 
     def test_register_site_add_conflict_rechecks_and_updates(self):
         with loaded_module() as module:

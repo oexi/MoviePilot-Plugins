@@ -66,7 +66,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.21"
+    plugin_version = "3.2.22"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -803,7 +803,12 @@ class JackettExtend(_PluginBase):
             if exists:
                 # B1: 更新分支只同步 name/url/public 来源字段,
                 # 保留 is_active/pri/proxy 等用户站点设置不被 cron 覆盖
-                site_registry.update(exists.id, {"name": name, "url": url, "public": public})
+                source_fields = {"name": name, "url": url, "public": public}
+                if self._site_source_fields_match(exists, source_fields):
+                    # 宿主 SiteUpdated 只触发图标抓取、站点配置清理和用户数据刷新，
+                    # 虚拟站点来源字段未变化时不重复写库或通知，避免每轮同步产生无效请求。
+                    return True
+                site_registry.update(exists.id, source_fields)
                 logger.info(f"【{self.plugin_name}】已更新站点记录: {domain}")
             else:
                 # 新增才写入默认启停/优先级/代理
@@ -835,7 +840,7 @@ class JackettExtend(_PluginBase):
                         raise
                     site_registry.update(existing.id, {"name": name, "url": url, "public": public})
                     logger.debug(f"【{self.plugin_name}】站点已存在(并发注册),转为更新: {domain}, {type(e).__name__}: {str(e)}")
-            # 通知宿主刷新站点缓存
+            # 与宿主新增/修改站点接口一致，站点行变化后发送 SiteUpdated
             try:
                 site_registry.notify_updated(domain)
             except Exception as e:
@@ -845,6 +850,15 @@ class JackettExtend(_PluginBase):
         except Exception as e:
             logger.error(f"【{self.plugin_name}】注册站点 {domain} 到 DB 失败: {str(e)}")
             return False
+
+    @staticmethod
+    def _site_source_fields_match(site: object, fields: dict) -> bool:
+        """Whether a persisted row already carries the plugin-owned fields."""
+        return (
+            str(getattr(site, "name", "") or "") == fields["name"]
+            and str(getattr(site, "url", "") or "") == fields["url"]
+            and (1 if getattr(site, "public", 0) == 1 else 0) == fields["public"]
+        )
 
     def _parse_indexer_sites(self) -> list:
         """
@@ -1206,10 +1220,14 @@ class JackettExtend(_PluginBase):
                 login_url = f"{host}/UI/Dashboard"
                 login_res = None
                 try:
-                    login_res = RequestUtils(headers=headers, session=session, timeout=timeout).post_res(
+                    login_res = RequestUtils(
+                        headers=headers,
+                        session=session,
+                        proxies=settings.PROXY if proxy else None,
+                        timeout=timeout,
+                    ).post_res(
                         url=login_url,
                         data={"password": password},
-                        proxies=settings.PROXY if proxy else None,
                         stream=True,
                     )
                 except Exception as e:
@@ -1227,9 +1245,14 @@ class JackettExtend(_PluginBase):
                     logger.warning(f"【{self.plugin_name}】Jackett 登录失败，无法获取 cookie")
 
             indexer_query_url = f"{host}/api/v2.0/indexers?configured=true"
-            with RequestUtils(headers=headers, cookies=cookie, timeout=timeout).get_stream(
-                indexer_query_url,
+            # 代理交给构造参数，宿主才会对代理下的 HTTPS 幂等请求启用 TLS 1.2 回退。
+            with RequestUtils(
+                headers=headers,
+                cookies=cookie,
                 proxies=settings.PROXY if proxy else None,
+                timeout=timeout,
+            ).get_stream(
+                indexer_query_url,
                 raise_exception=True,
             ) as ret:
                 # E3: 校验状态码/Content-Type/数据类型,json 只解析一次
@@ -1472,9 +1495,16 @@ class JackettExtend(_PluginBase):
         )
         request_proxy = bool(request_config.get("proxy", getattr(self, "_proxy", False)))
         try:
-            with RequestUtils(timeout=request_timeout).get_stream(
-                url,
+            headers = {
+                "User-Agent": settings.USER_AGENT,
+                "Accept": "application/xml, application/rss+xml, text/xml, */*",
+            }
+            with RequestUtils(
+                headers=headers,
                 proxies=settings.PROXY if request_proxy else None,
+                timeout=request_timeout,
+            ).get_stream(
+                url,
                 raise_exception=True,
             ) as ret:
                 if ret is None:

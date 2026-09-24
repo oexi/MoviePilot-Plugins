@@ -141,3 +141,28 @@ def test_real_host_load_registers_api_and_reloads_in_place(
         manager.stop(plugin_id)
         manager.remove_plugin(plugin_id)
         configure_plugin_routes(previous_registry)
+
+
+@pytest.mark.parametrize("plugin_id, module_id", PLUGIN_CASES)
+def test_bridge_resolves_chain_base_from_sdk_not_compat_root(
+    plugin_id: str,
+    module_id: str,
+) -> None:
+    """桥接直接使用 SDK 导出的 ChainBase，不经过 app.chain 包根兼容符号。"""
+    del plugin_id
+    from unittest import mock
+
+    compat = import_module(f"app.plugins.{module_id}._host_compat")
+    sdk_chain_base = import_module("app.sdk.chain").ChainBase
+    assert sdk_chain_base is import_module("app.chain.base").ChainBase
+
+    class ShadowChainBase:
+        """模拟即将退场的包根兼容符号。"""
+
+    with mock.patch.object(
+        import_module("app.chain"),
+        "ChainBase",
+        ShadowChainBase,
+        create=True,
+    ):
+        assert compat._find_chain_base() is sdk_chain_base

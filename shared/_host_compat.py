@@ -210,14 +210,23 @@ def _record_bridge_error(
         pass
 
 
+# Prefer the stable SDK export.  ``app.chain`` package-root symbols are served
+# by MoviePilot's versioned Compat layer; ``app.chain.base`` is the canonical
+# owner and remains a fallback.  All paths resolve to the same class object.
+_CHAIN_BASE_MODULES = ("app.sdk.chain", "app.chain.base")
+
+
 def _find_chain_base() -> Optional[type]:
     """Lazily resolve the current host boundary."""
-    try:
-        module = importlib.import_module("app.chain")
-    except (ImportError, ModuleNotFoundError):
-        return None
-    chain_base = getattr(module, "ChainBase", None)
-    return chain_base if inspect.isclass(chain_base) else None
+    for module_name in _CHAIN_BASE_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        chain_base = getattr(module, "ChainBase", None)
+        if inspect.isclass(chain_base):
+            return chain_base
+    return None
 
 
 def _normalise_domain(site: Mapping) -> str:

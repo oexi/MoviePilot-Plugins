@@ -74,7 +74,7 @@ class ProwlarrCompatContractTest(unittest.TestCase):
                 calls.append(("async-refresh", site, keyword))
                 return ["host"]
 
-        host_chain = import_module("app.chain")
+        host_chain = import_module("app.sdk.chain")
         previous_chain_base = host_chain.ChainBase
         host_chain.ChainBase = ChainBase
         try:
@@ -276,7 +276,7 @@ class ProwlarrCompatContractTest(unittest.TestCase):
             async def async_refresh_torrents(self, site, keyword, *args, **kwargs):
                 return ["host-async-refresh"]
 
-        host_chain = import_module("app.chain")
+        host_chain = import_module("app.sdk.chain")
         previous_chain_base = host_chain.ChainBase
         host_chain.ChainBase = ChainBase
         try:
@@ -344,7 +344,7 @@ class ProwlarrCompatContractTest(unittest.TestCase):
             async def async_refresh_torrents(self, site, keyword, *args, **kwargs):
                 return ["host"]
 
-        host_chain = import_module("app.chain")
+        host_chain = import_module("app.sdk.chain")
         previous_chain_base = host_chain.ChainBase
         host_chain.ChainBase = ChainBase
         try:

@@ -85,7 +85,7 @@ def make_chain():
 
 class HostCompatTest(unittest.TestCase):
     def setUp(self):
-        self.host_chain = import_module("app.chain")
+        self.host_chain = import_module("app.sdk.chain")
         self.previous_chain_base = self.host_chain.ChainBase
         self.ChainBase, self.host_calls = make_chain()
         self.host_chain.ChainBase = self.ChainBase

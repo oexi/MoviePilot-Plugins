@@ -16,7 +16,7 @@ from app.schemas.plugin import PluginInstance
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ChainBase = import_module("app.chain").ChainBase
+ChainBase = import_module("app.sdk.chain").ChainBase
 
 
 class _NoopLogger:

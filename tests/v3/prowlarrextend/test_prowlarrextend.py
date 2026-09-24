@@ -194,7 +194,7 @@ def loaded_module():
 def _uninstall_loaded_plugin_bridge(module) -> None:
     """回收该生产模块在宿主 ChainBase 上留下的桥接 owner。"""
     try:
-        from app.chain import ChainBase
+        from app.sdk.chain import ChainBase
 
         compat = module._host_compat
         state = getattr(ChainBase, compat._STATE_ATTR, None)
@@ -250,7 +250,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(manifest["ProwlarrExtend"]["version"], module.ProwlarrExtend.plugin_version)
             self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
             self.assertEqual(manifest["ProwlarrExtend"]["author"], "oexi")
-            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.21")
+            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.22")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "oexi")
@@ -327,7 +327,10 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(calls[1][1], "https://prowlarr.invalid/api/v1/indexer")
             self.assertEqual(calls[0][1]["timeout"], 17)
             self.assertEqual(calls[0][1]["headers"]["X-Api-Key"], "not-a-real-key")
-            self.assertEqual(calls[1][2]["proxies"], module.settings.PROXY if hasattr(module, "settings") else {"http": "http://proxy.invalid"})
+            # Proxies belong to the RequestUtils constructor so the host's
+            # proxied-HTTPS TLS 1.2 fallback can see them.
+            self.assertEqual(calls[0][1]["proxies"], module.settings.PROXY)
+            self.assertNotIn("proxies", calls[1][2])
             self.assertTrue(calls[1][2]["raise_exception"])
 
     def test_fetch_http_json_empty_and_bounds_fail_closed(self):
@@ -624,7 +627,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             plugin.search_torrents(site=site, keyword="Sample Film")
             self.assertEqual(timeouts, [12])
 
-    def test_empty_refresh_propagates_sanitized_http_429_only(self):
+    def test_empty_async_browse_propagates_sanitized_http_429_only(self):
         with loaded_module() as module:
             response = _Response(
                 status_code=429,
@@ -660,13 +663,13 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(plugin.search_torrents(site=site, keyword="title"), [])
             self.assertEqual(plugin.search_torrents(site=site, keyword=None), [])
 
+            # The host's synchronous refresh loop has no per-site isolation.
+            self.assertEqual(plugin.refresh_torrents(site=site, keyword=None), [])
+
             with self.assertRaises(module._host_compat.SanitizedUpstreamError) as raised:
-                plugin.refresh_torrents(site=site, keyword=None)
+                asyncio.run(plugin.async_refresh_torrents(site=site, keyword=None))
             self.assertEqual(raised.exception.category, "http_429")
             self.assertNotIn("sensitive-upstream-value", str(raised.exception))
-
-            with self.assertRaises(module._host_compat.SanitizedUpstreamError):
-                asyncio.run(plugin.async_refresh_torrents(site=site, keyword=None))
 
     def test_streaming_rest_and_xml_reads_never_touch_buffered_body(self):
         with loaded_module() as module:
@@ -825,6 +828,63 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertTrue(oversized_json.closed)
             self.assertEqual(oversized_json.iterated_chunks, 2)
 
+    def test_host_sync_refresh_loop_survives_upstream_failure(self):
+        from unittest import mock
+
+        from app.chain import torrents as torrents_module
+
+        with loaded_module() as module:
+            response = _Response(
+                status_code=503,
+                headers={"Content-Type": "text/html"},
+                text="unavailable",
+            )
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(response)
+
+            module.RequestUtils = Request
+            plugin = module.ProwlarrExtend()
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }
+            self.assertTrue(module._host_compat.install(
+                plugin,
+                predicate=plugin._is_virtual_site,
+                owner_key=plugin._bridge_owner_key_for_runtime(),
+            ))
+            site = {
+                "id": 4,
+                "name": "Sample Prowlarr",
+                "domain": "prowlarr_extend.7",
+                "plugin": "ProwlarrExtend",
+                "parser": "ProwlarrExtend",
+            }
+
+            class Helper:
+                def get_indexer(self, _domain):
+                    return site
+
+                async def async_get_indexer(self, _domain):
+                    return site
+
+            chain = torrents_module.TorrentsChain()
+            with mock.patch.object(torrents_module, "SitesHelper", Helper):
+                # TorrentsChain.refresh() calls browse() for every subscribed
+                # site without per-site isolation; one failing indexer must
+                # not abort the whole spider refresh.
+                self.assertEqual(chain.browse(domain="prowlarr_extend.7", page=0), [])
+                # The async site-browse API still reports the failure.
+                with self.assertRaises(module._host_compat.SanitizedUpstreamError):
+                    asyncio.run(chain.async_browse(domain="prowlarr_extend.7", page=0))
+
     def test_real_response_read_timeout_is_distinct_and_refresh_stays_sanitized(self):
         with loaded_module() as module:
             plugin = object.__new__(module.ProwlarrExtend)
@@ -857,7 +917,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
             module.RequestUtils = Request
             with self.assertRaises(module._host_compat.SanitizedUpstreamError) as raised:
-                plugin.refresh_torrents(site=site, keyword=None)
+                asyncio.run(plugin.async_refresh_torrents(site=site, keyword=None))
             self.assertEqual(raised.exception.category, "timeout")
             self.assertEqual(plugin._last_search_error, "timeout")
             self.assertEqual(xml_close_calls, [True])
@@ -1384,6 +1444,68 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             )
             self.assertTrue(plugin._fetch_ok)
             self.assertEqual(result, [[]])
+
+    def test_register_site_skips_unchanged_row_without_site_updated(self):
+        with loaded_module() as module:
+            existing = types.SimpleNamespace(
+                id=17,
+                domain="prowlarr_extend.7",
+                name="Indexer 7",
+                url="https://prowlarr_extend.7/",
+                public=0,
+            )
+            state = types.SimpleNamespace(updates=[], events=[])
+
+            class FakeSiteOper:
+                def get_by_domain(self, _domain):
+                    return existing
+
+                def update(self, site_id, payload):
+                    state.updates.append((site_id, payload))
+
+                def add(self, **_payload):
+                    raise AssertionError("existing rows must not use add")
+
+            class EventManager:
+                def send_event(self, event, payload):
+                    state.events.append((event, payload))
+
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 1
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                result = plugin._ProwlarrExtend__register_site({
+                    "name": "Indexer 7",
+                    "domain": "prowlarr_extend.7",
+                    "public": False,
+                    "proxy": False,
+                }, generation=1)
+
+            self.assertTrue(result)
+            self.assertEqual(state.updates, [])
+            self.assertEqual(state.events, [])
+
+            # A changed plugin-owned field still updates and notifies.
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                result = plugin._ProwlarrExtend__register_site({
+                    "name": "Indexer 7 renamed",
+                    "domain": "prowlarr_extend.7",
+                    "public": False,
+                    "proxy": False,
+                }, generation=1)
+
+            self.assertTrue(result)
+            self.assertEqual(state.updates, [(17, {
+                "name": "Indexer 7 renamed",
+                "url": "https://prowlarr_extend.7/",
+                "public": 0,
+            })])
+            self.assertEqual(
+                state.events,
+                [("SiteUpdated", {"domain": "prowlarr_extend.7"})],
+            )
 
     def test_register_site_add_false_contract_rechecks_and_updates(self):
         with loaded_module() as module:

@@ -133,6 +133,10 @@ def _configure_plugin_runtime() -> None:
                         update={"is_default_target": False}
                     )
 
+    def _runtime_declaration(_plugin_id: str) -> dict[str, bool]:
+        # 测试插件未经市场安装、没有身份行声明快照，按宿主"未声明即兼容"语义回落。
+        return {}
+
     def build_test_plugin_runtime(host):
         """把真实宿主运行时组件指向当前仓库的 V3 源码目录。"""
         environment_kwargs = {
@@ -154,6 +158,8 @@ def _configure_plugin_runtime() -> None:
             environment_kwargs["set_default_target"] = _set_default_target
         if "clear_default_target" in environment_parameters:
             environment_kwargs["clear_default_target"] = _clear_default_target
+        if "runtime_declaration" in environment_parameters:
+            environment_kwargs["runtime_declaration"] = _runtime_declaration
 
         return build_plugin_runtime(
             host,
