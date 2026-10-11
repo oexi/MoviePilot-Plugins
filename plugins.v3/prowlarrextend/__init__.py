@@ -68,7 +68,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "1.0.9"
+    plugin_version = "1.0.10"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -416,6 +416,8 @@ class ProwlarrExtend(_PluginBase):
                       source: str = "sync"):
         """Remember only a bounded, non-sensitive diagnostic category."""
         safe = self._safe_error_category(category)
+        if source == "search":
+            _host_compat.note_search_error(safe)
         with self._state_lock:
             if generation is not None and not self._sync_is_current(generation):
                 return
@@ -1021,76 +1023,78 @@ class ProwlarrExtend(_PluginBase):
         # old snapshot intentionally contains an empty value.
         host = self._normalize_host(config_snapshot.get("host"))
         api_key = str(config_snapshot.get("api_key", "") or "")
-        try:
-            if not host or not api_key:
-                self._record_error("missing_config", source="search")
-                return results
-            # D6: 搜索热路径日志降为 DEBUG,关键词仅 DEBUG 输出且脱敏
-            logger.debug(f"【{self.plugin_name}】开始检索 Indexer：\"{site.get('name')}\"，关键词：\"{masked_keyword}\"")
+        with _host_compat.observe_search_page() as observed_page:
+            try:
+                if not host or not api_key:
+                    self._record_error("missing_config", source="search")
+                    return results
+                # D6: 搜索热路径日志降为 DEBUG,关键词仅 DEBUG 输出且脱敏
+                logger.debug(f"【{self.plugin_name}】开始检索 Indexer：\"{site.get('name')}\"，关键词：\"{masked_keyword}\"")
 
-            # Prowlarr authenticates through X-Api-Key.  Keep the key out of
-            # query strings and therefore out of URL/log/referrer surfaces.
-            params = {
-                "t": "search",
-                "q": keyword,
-            }
-            # BUGFIX: 透传用户在站点浏览弹窗中显式选择的分类 ID。
-            # 宿主 /site/{id}/category 返回的条目 id 会以逗号分隔字符串回传
-            # (如 "2000,3000")，Prowlarr torznab cat 参数同样接受该格式，
-            # 让 UI 分类筛选真实生效；未显式选择时不传 cat，
-            # 保持按标题/媒体类型兜底过滤的既有语义。
-            cat_value = str(cat or "").strip()
-            # Prowlarr's canonical music category is 3000.  Keep this narrow
-            # fallback for music while leaving movie/TV category discovery to
-            # the caller-selected caps; do not inject Prowlarr-only 2000/5000
-            # defaults into a music request.
-            if not cat_value and mtype is not None:
-                mtype_value = str(getattr(mtype, "value", mtype)).lower()
-                mtype_name = str(getattr(mtype, "name", "")).lower()
-                if mtype_value == "music" or mtype_value == "音乐" or mtype_name == "music":
-                    cat_value = "3000"
-            if cat_value:
-                cat_value = re.sub(r"\s+", "", cat_value)
-                if re.fullmatch(r"\d+(,\d+)*", cat_value):
-                    params["cat"] = cat_value
-                else:
-                    logger.debug(f"【{self.plugin_name}】忽略非分类 ID 格式的 cat 参数")
-            api_url = build_torznab_url(
-                host,
-                indexer_id,
-                keyword=keyword,
-                cat=params.get("cat"),
-            )
-            if not api_url:
-                self._record_error("invalid_search_url", source="search")
-                return results
+                # Prowlarr authenticates through X-Api-Key.  Keep the key out of
+                # query strings and therefore out of URL/log/referrer surfaces.
+                params = {
+                    "t": "search",
+                    "q": keyword,
+                }
+                # BUGFIX: 透传用户在站点浏览弹窗中显式选择的分类 ID。
+                # 宿主 /site/{id}/category 返回的条目 id 会以逗号分隔字符串回传
+                # (如 "2000,3000")，Prowlarr torznab cat 参数同样接受该格式，
+                # 让 UI 分类筛选真实生效；未显式选择时不传 cat，
+                # 保持按标题/媒体类型兜底过滤的既有语义。
+                cat_value = str(cat or "").strip()
+                # Prowlarr's canonical music category is 3000.  Keep this narrow
+                # fallback for music while leaving movie/TV category discovery to
+                # the caller-selected caps; do not inject Prowlarr-only 2000/5000
+                # defaults into a music request.
+                if not cat_value and mtype is not None:
+                    mtype_value = str(getattr(mtype, "value", mtype)).lower()
+                    mtype_name = str(getattr(mtype, "name", "")).lower()
+                    if mtype_value == "music" or mtype_value == "音乐" or mtype_name == "music":
+                        cat_value = "3000"
+                if cat_value:
+                    cat_value = re.sub(r"\s+", "", cat_value)
+                    if re.fullmatch(r"\d+(,\d+)*", cat_value):
+                        params["cat"] = cat_value
+                    else:
+                        logger.debug(f"【{self.plugin_name}】忽略非分类 ID 格式的 cat 参数")
+                api_url = build_torznab_url(
+                    host,
+                    indexer_id,
+                    keyword=keyword,
+                    cat=params.get("cat"),
+                )
+                if not api_url:
+                    self._record_error("invalid_search_url", source="search")
+                    return results
 
-            result_array = self.__parse_torznab_xml(
-                api_url, site=site, mtype=mtype, keyword=keyword,
-                config_snapshot=config_snapshot,
-                propagate_upstream_error=propagate_upstream_error,
-            )
+                result_array = self.__parse_torznab_xml(
+                    api_url, site=site, mtype=mtype, keyword=keyword,
+                    config_snapshot=config_snapshot,
+                    propagate_upstream_error=propagate_upstream_error,
+                )
+                observed_page["raw_count"] = len(result_array or [])
 
-            if not result_array:
-                # D6: 无结果是常态,降为 DEBUG
-                logger.debug(f"【{self.plugin_name}】Indexer：\"{site.get('name')}\" 未检索到数据，关键词：\"{masked_keyword}\"")
-                return results
+                if not result_array:
+                    # D6: 无结果是常态,降为 DEBUG
+                    logger.debug(f"【{self.plugin_name}】Indexer：\"{site.get('name')}\" 未检索到数据，关键词：\"{masked_keyword}\"")
+                    return results
 
-            logger.debug(f"【{self.plugin_name}】Indexer：\"{site.get('name')}\" 返回数据：{len(result_array)} 条")
-            results.extend(result_array)
+                logger.debug(f"【{self.plugin_name}】Indexer：\"{site.get('name')}\" 返回数据：{len(result_array)} 条")
+                results.extend(result_array)
 
-        except _host_compat.SanitizedUpstreamError:
-            # Only the dedicated empty-keyword refresh route opts into this
-            # process-stable, non-sensitive signal.  Ordinary searches never
-            # request propagation and remain fail-closed.
-            raise
-        except Exception as e:
-            # D8: 异常日志附带 URL/站点/关键词(脱敏)/异常类型
-            self._record_error("search_error", source="search")
-            logger.error(
-                f"【{self.plugin_name}】检索出错：site={site.get('name')}, indexer={indexer_id}, "
-                f"url={redact_url(api_url) if api_url else '-'}, 关键词={masked_keyword or '-'}, "
-                f"类型={type(e).__name__}")
+            except _host_compat.SanitizedUpstreamError:
+                # Only the dedicated empty-keyword refresh route opts into this
+                # process-stable, non-sensitive signal.  Ordinary searches never
+                # request propagation and remain fail-closed.
+                raise
+            except Exception as e:
+                # D8: 异常日志附带 URL/站点/关键词(脱敏)/异常类型
+                self._record_error("search_error", source="search")
+                logger.error(
+                    f"【{self.plugin_name}】检索出错：site={site.get('name')}, indexer={indexer_id}, "
+                    f"url={redact_url(api_url) if api_url else '-'}, 关键词={masked_keyword or '-'}, "
+                    f"类型={type(e).__name__}")
 
         return results
 

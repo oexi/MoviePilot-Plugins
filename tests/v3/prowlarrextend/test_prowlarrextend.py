@@ -250,7 +250,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(manifest["ProwlarrExtend"]["version"], module.ProwlarrExtend.plugin_version)
             self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
             self.assertEqual(manifest["ProwlarrExtend"]["author"], "oexi")
-            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.22")
+            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.23")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "oexi")

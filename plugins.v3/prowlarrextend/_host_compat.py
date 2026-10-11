@@ -14,6 +14,7 @@ host's global plugin route, ordinary-site route and page-size calculation
 remain host-owned.
 """
 
+import contextlib
 import functools
 import importlib
 import inspect
@@ -25,6 +26,7 @@ import time
 import types
 import weakref
 from collections.abc import Mapping
+from contextvars import ContextVar
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
@@ -129,6 +131,68 @@ def _is_sanitized_upstream_error(error: BaseException) -> bool:
 
 def _propagates_upstream_error(route: str, error: BaseException) -> bool:
     return route in _OPTIONAL_METHODS and _is_sanitized_upstream_error(error)
+
+
+# Per-call page outcome of one owned virtual-site search.  The plugin's own
+# error recorder notes failures here so the search entry can publish a single
+# outcome without threading flags through the torznab parser.
+_SEARCH_PAGE: ContextVar[Optional[dict]] = ContextVar(
+    "moviepilot_virtual_site_search_page", default=None
+)
+
+
+def _host_search_reporters():
+    """Return the host's site-search observers, or ``None`` on older hosts."""
+    try:
+        observation = importlib.import_module("app.application.site.observation")
+        return (
+            observation.report_site_search_outcome,
+            observation.report_site_search_page,
+        )
+    except Exception:
+        return None
+
+
+def note_search_error(category: object) -> None:
+    """Mark the current owned page as failed; the first category wins."""
+    page = _SEARCH_PAGE.get()
+    if page is not None and page["error"] is None:
+        page["error"] = str(category or "search_error")
+
+
+@contextlib.contextmanager
+def observe_search_page():
+    """Publish one owned page to the host's per-call search observation.
+
+    MoviePilot v3.1+ wraps every site page in ``capture_site_search_observation``
+    and treats a page whose indexer reported nothing as an unfinished request
+    ("本页请求未完成"), discarding its results.  The host ``IndexerModule``
+    reports for real sites; plugin-owned virtual sites must do the same.
+    Virtual sites never paginate, so a successful page is always the last one.
+    Hosts without the observer make this a no-op.
+    """
+    page = {"error": None, "raw_count": 0}
+    token = _SEARCH_PAGE.set(page)
+    try:
+        yield page
+    except Exception:
+        note_search_error("search_error")
+        raise
+    finally:
+        _SEARCH_PAGE.reset(token)
+        reporters = _host_search_reporters()
+        if reporters is not None:
+            report_outcome, report_page = reporters
+            try:
+                if page["error"]:
+                    report_outcome(attempted=True, outcome="error", error=page["error"])
+                else:
+                    report_outcome(attempted=True, outcome="success")
+                    report_page(raw_count=int(page["raw_count"] or 0), has_more=False)
+            except Exception as error:
+                _emit_bridge_warning(
+                    f"virtual-site search outcome report failed ({type(error).__name__})"
+                )
 
 
 def _diagnostic_owner_key(owner: object) -> str:

@@ -1,5 +1,6 @@
 """Regression tests for the V3 plugin API route contracts."""
 
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,13 @@ from app.plugins.prowlarrextend._api_models import (
 from app.runtime.extensions.plugin.projection import PluginProjection
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
+
+# Older V3 hosts require ``protected_routes``; newer hosts removed the argument.
+_REGISTRY_COMPAT_KWARGS = (
+    {"protected_routes": set()}
+    if "protected_routes" in inspect.signature(FastAPIDynamicRouteRegistry.__init__).parameters
+    else {}
+)
 
 
 @dataclass(frozen=True)
@@ -150,7 +158,7 @@ def route_context() -> _RouteContext:
         verify_token=verify_token,
         verify_apikey=verify_apikey,
         prefix="/api/v1/plugin",
-        protected_routes=set(),
+        **_REGISTRY_COMPAT_KWARGS,
         log=logger,
     )
     return context

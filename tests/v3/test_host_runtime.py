@@ -26,6 +26,13 @@ PLUGIN_CASES = (
     ("ProwlarrExtend", "prowlarrextend"),
 )
 
+# Older V3 hosts require ``protected_routes``; newer hosts removed the argument.
+_REGISTRY_COMPAT_KWARGS = (
+    {"protected_routes": set()}
+    if "protected_routes" in inspect.signature(FastAPIDynamicRouteRegistry.__init__).parameters
+    else {}
+)
+
 
 @pytest.mark.parametrize("plugin_id, module_id", PLUGIN_CASES)
 def test_plugins_use_sdk_base_and_explicit_module_contracts(
@@ -90,7 +97,7 @@ def test_real_host_load_registers_api_and_reloads_in_place(
         verify_token=lambda: None,
         verify_apikey=lambda: None,
         prefix="/api/v1/plugin",
-        protected_routes=set(),
+        **_REGISTRY_COMPAT_KWARGS,
         log=plugin_logger,
     )
     configure_plugin_routes(registry)

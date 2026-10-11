@@ -1,6 +1,6 @@
 # JackettExtend V3-only 迁移说明
 
-JackettExtend 现仅支持当前 MoviePilot V3，插件版本为 `3.2.22`，由 oexi 独立维护。原始项目作者为 jtcymc，原始项目地址为 <https://github.com/jtcymc/MoviePilot-PluginsV2>。
+JackettExtend 现仅支持当前 MoviePilot V3，插件版本为 `3.2.23`，由 oexi 独立维护。原始项目作者为 jtcymc，原始项目地址为 <https://github.com/jtcymc/MoviePilot-PluginsV2>。
 
 V2 版 `ProwlarrExtend` 已删除，仓库不再提供 MoviePilot V2 插件；`package.json` 和 `package.v2.json` 也已移除。
 
