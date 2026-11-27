@@ -29,13 +29,13 @@ class AuthBypass(_PluginBase):
     # 插件描述
     plugin_desc = "把站点用户认证等级固定为已认证（2），跳过用户认证与站点认证校验"
     # 插件图标
-    plugin_icon = "AuthBypass.png"
+    plugin_icon = "https://raw.githubusercontent.com/oexi/MoviePilot-Plugins/main/icons/AuthBypass.png"
     # 插件版本
     plugin_version = "1.0.0"
     # 插件作者
-    plugin_author = "local"
+    plugin_author = "oexi"
     # 作者主页
-    author_url = "https://github.com/jxxghp/MoviePilot"
+    author_url = "https://github.com/oexi"
     # 插件配置项ID前缀
     plugin_config_prefix = "authbypass_"
     # 加载顺序，必须早于需要认证的插件，让它们在准入判断前看到已认证等级

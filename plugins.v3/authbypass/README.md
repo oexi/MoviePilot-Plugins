@@ -5,8 +5,12 @@
 
 - 插件 ID：`AuthBypass`
 - 版本：`1.0.0`
+- 作者：`oexi`
 - 自身认证等级：`0`（未认证状态也能加载）
 - 修改范围：仅运行时对象，不改宿主代码、不改资源包 `.so` / `.bin`，停用即恢复
+- 图标：`icons/AuthBypass.png`。插件类与 `package.v3.json` 都使用 raw 完整 URL——
+  MoviePilot 前端只对 `http(s)` 开头的图标走图片代理，文件名形式会去前端内置的
+  `plugin_icon/` 目录找，而该目录只打包官方插件仓的图标
 
 ## 原理
 

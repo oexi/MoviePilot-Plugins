@@ -84,8 +84,8 @@
     "description": "把站点用户认证等级固定为已认证（2），跳过用户认证与站点认证校验",
     "labels": "工具,认证",
     "version": "1.0.0",
-    "icon": "AuthBypass.png",
-    "author": "local",
+    "icon": "https://raw.githubusercontent.com/oexi/MoviePilot-Plugins/main/icons/AuthBypass.png",
+    "author": "oexi",
     "level": 0,
     "history": {
       "v1.0.0": "首个版本：替换资源扩展 SitesHelper.auth_level 与 check_user，固定认证等级为 2，并放行 auth_level=99 的插件准入判断"
